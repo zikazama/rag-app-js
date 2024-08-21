@@ -1,68 +1,79 @@
 import express from "express";
-import mongoose from "mongoose";
-import PDF from "./models/PDFModel.js";
-import runRAG from "./utils/rag.js";
-import ragApplication from "./config/ragConfig.js";
+import cors from "cors";
+import { OpenAI } from "langchain/llms/openai";
+import { SqlDatabase } from "langchain/sql_db";
+import { createSqlAgent, SqlToolkit } from "langchain/agents/toolkits/sql";
+import { DataSource } from "typeorm";
+import { configDotenv } from "dotenv";
 
+// Load configuration
+try {
+  configDotenv();
+} catch (e) {
+  console.error("Error loading configuration:", e);
+  process.exit(1);
+}
+
+// Create server
 const app = express();
+app.use(cors());
 
-// Connect to MongoDB
-mongoose.connect("mongodb://localhost:27017/ragApp");
+// Create database connection
+const datasource = new DataSource({
+  type: "sqlite",
+  database: "./data/northwind.db",
+});
+const db = await SqlDatabase.fromDataSourceParams({
+  appDataSource: datasource,
+});
+const toolkit = new SqlToolkit(db);
 
-app.use(express.json());
+// Create OpenAI model
+const model = new OpenAI({
+  temperature: 0,
+});
+const executor = createSqlAgent(model, toolkit);
 
-// API endpoint untuk mengunggah PDF dan memprosesnya
-app.post("/upload", async (req, res) => {
+// Route handler
+app.get("/api/query", async (req, res) => {
+  const prompt = req.query.prompt;
+
+  console.log("prompt: " + prompt);
+
+  let response = {
+    prompt: prompt,
+    sqlQuery: "",
+    result: [],
+    error: "",
+  };
+
   try {
-    const filePath = req.body.filePath; // Path ke file PDF
-    const response = await runRAG(filePath);
+    const result = await executor.call({ input: prompt });
 
-    const pdfDocument = new PDF({
-      title: req.body.title || "Untitled PDF",
-      content: response,
+    result.intermediateSteps.forEach((step) => {
+      if (step.action.tool === "query-sql") {
+        response.prompt = prompt;
+        response.sqlQuery = step.action.toolInput;
+        response.result = JSON.parse(step.observation);
+      }
     });
 
-    await pdfDocument.save();
+    console.log(
+      `Intermediate steps ${JSON.stringify(result.intermediateSteps, null, 2)}`
+    );
 
-    res
-      .status(200)
-      .json({
-        message: "PDF processed and saved successfully!",
-        data: response,
-      });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(200).json(response);
+  } catch (e) {
+    console.log(e + " " + "my error message");
+    response.error = "Server error. Try again with a different prompt.";
+
+    res.status(500).json(response);
   }
+
+  await datasource.destroy();
 });
 
-// API endpoint untuk mengambil PDF yang tersimpan
-app.get("/pdfs", async (req, res) => {
-  try {
-    const pdfs = await PDF.find();
-    res.status(200).json(pdfs);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// API untuk jawab pertanyaan
-app.post("/chat", async (req, res) => {
-  try {
-    console.log(ragApplication);
-    // const response = await ragApplication.query(req.body.message);
-    // res
-    //   .status(200)
-    //   .json({
-    //     message: "Success",
-    //     data: response,
-    //   });
-  } catch (error) {
-    console.log(error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+// Start server
+app.listen(5000, () => {
+  console.log("Server started on port 5000");
 });
